@@ -9,13 +9,13 @@ use std::{
     ptr::NonNull,
 };
 
-type NodePtr<T> = Option<NonNull<Slot<T>>>;
-
+// We could start off small, and only store 4 slots like a Vec, however in this case
+// the allocations stick around for the lifetime of the pool so I figure that it's
+// probably a bit better to start off bigger.
 const DEFAULT_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub enum PoolErrorKind {
-    PoolFull,
     CapacityOverflow,
     AllocatorError,
 }
@@ -24,7 +24,6 @@ impl Display for PoolErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("allocation failed")?;
         let msg = match self {
-            PoolErrorKind::PoolFull => " because the pool is full",
             PoolErrorKind::CapacityOverflow => " because the computed capacity overflowed",
             PoolErrorKind::AllocatorError => " because the allocator returned an error",
         };
@@ -34,13 +33,23 @@ impl Display for PoolErrorKind {
 
 impl Error for PoolErrorKind {}
 
+// This is where an individual item in the pool is stored. When in the `free` state it is
+// part of a linked-list of empty slots. During allocation it is removed from the list
+// and placed into a Handle, then when the handle drops the Slot is re-inserted into the
+// linked-list of free slots.
 union Slot<T> {
     used: ManuallyDrop<T>,
-    free: NodePtr<T>,
+    free: SlotPtr<T>,
 }
+type SlotPtr<T> = Option<NonNull<Slot<T>>>;
 
 struct ChunkHeader {
+    // Chunks are stored as a linked-list, so this stores the pointer to the next chunk.
     next: Option<NonNull<ChunkHeader>>,
+    // Each chunk is of a different size, dependent on the size of the `T` in the pool
+    // and the capacity of the chunk.
+    // To avoid making the ChunkManager generic over `T` so it can drop the chunk we
+    // store the size of the allocation.
     layout: Layout,
 }
 
@@ -68,14 +77,17 @@ impl ChunkLayout {
     }
 }
 
-struct AllocData {
+// This manages the allocation and deallocation of our chunks.
+// We track the total capacity here because it is used while growing the storage
+// so that we grow like a Vec.
+struct ChunkManager {
     // The total capacity of all the chunks together.
     total_capacity: usize,
     // Pointer to the first chunk in our allocation list.
     chunks: Option<NonNull<ChunkHeader>>,
 }
 
-impl Drop for AllocData {
+impl Drop for ChunkManager {
     fn drop(&mut self) {
         // SAFETY: Allocations using any chunk borrow the entire pool. The borrow checker ensures
         // that we can't drop while a borrow exists.
@@ -95,10 +107,13 @@ impl Drop for AllocData {
     }
 }
 
-impl AllocData {
+impl ChunkManager {
     /// Grows by either the requested `additional` capacity, or `self.total_capacity`, whichever is larger.
     /// This results in at least doubling the capacity each time.
-    fn grow<T: Sized>(&mut self, additional: usize) -> Result<NewSlots<T>, PoolErrorKind> {
+    fn grow_ammortized<T: Sized>(
+        &mut self,
+        additional: usize,
+    ) -> Result<NewSlots<T>, PoolErrorKind> {
         assert!(additional > 0);
 
         let new_chunk_size = if self.total_capacity == 0 {
@@ -107,64 +122,69 @@ impl AllocData {
             additional.max(self.total_capacity)
         };
 
+        self.grow_exact(new_chunk_size)
+    }
+
+    // Grows a chunk of exactly `chunk_size` slots.
+    fn grow_exact<T: Sized>(&mut self, chunk_size: usize) -> Result<NewSlots<T>, PoolErrorKind> {
         let new_total_capacity = self
             .total_capacity
-            .checked_add(new_chunk_size)
+            .checked_add(chunk_size)
             .ok_or(PoolErrorKind::CapacityOverflow)?;
 
-        let (chunk_ptr, slot_ptr) = unsafe { allocate_chunk::<T>(self.chunks, new_chunk_size)? };
+        let (chunk_ptr, slot_ptr) = unsafe { self.allocate_chunk::<T>(chunk_size)? };
         self.chunks = Some(chunk_ptr);
         self.total_capacity = new_total_capacity;
 
         Ok(slot_ptr)
+    }
+
+    /// Allocates and initializes a new chunk.
+    unsafe fn allocate_chunk<T: Sized>(
+        &self,
+        capacity: usize,
+    ) -> Result<(NonNull<ChunkHeader>, NewSlots<T>), PoolErrorKind> {
+        assert!(capacity > 0);
+        let chunk_layout = ChunkLayout::get::<T>(capacity)?;
+
+        let alloc_ptr = std::alloc::alloc(chunk_layout.layout);
+        if alloc_ptr.is_null() {
+            return Err(PoolErrorKind::AllocatorError);
+        }
+
+        let chunk_ptr = alloc_ptr.cast::<ChunkHeader>();
+        chunk_ptr.write(ChunkHeader {
+            next: self.chunks,
+            layout: chunk_layout.layout,
+        });
+
+        let slots_ptr = alloc_ptr.add(chunk_layout.slots_offset).cast::<Slot<T>>();
+
+        // Initialize the slots into a linked list pointing to the next slot.
+        for i in 0..capacity - 1 {
+            let next = Slot {
+                free: NonNull::new(slots_ptr.add(i + 1)),
+            };
+            slots_ptr.add(i).write(next);
+        }
+
+        let slots_tail_ptr = slots_ptr.add(capacity - 1);
+        // Set the last one to point to nothing.
+        slots_tail_ptr.write(Slot { free: None });
+
+        Ok((
+            NonNull::new_unchecked(chunk_ptr),
+            NewSlots {
+                slot_head: NonNull::new_unchecked(slots_ptr),
+                slot_tail: NonNull::new_unchecked(slots_tail_ptr),
+            },
+        ))
     }
 }
 
 struct NewSlots<T> {
     slot_head: NonNull<Slot<T>>,
     slot_tail: NonNull<Slot<T>>,
-}
-
-/// Allocates and initializes a new chunk.
-unsafe fn allocate_chunk<T: Sized>(
-    next_chunk: Option<NonNull<ChunkHeader>>,
-    capacity: usize,
-) -> Result<(NonNull<ChunkHeader>, NewSlots<T>), PoolErrorKind> {
-    assert!(capacity > 0);
-    let chunk_layout = ChunkLayout::get::<T>(capacity)?;
-
-    let alloc_ptr = std::alloc::alloc(chunk_layout.layout);
-    if alloc_ptr.is_null() {
-        return Err(PoolErrorKind::AllocatorError);
-    }
-
-    let chunk_ptr = alloc_ptr.cast::<ChunkHeader>();
-    chunk_ptr.write(ChunkHeader {
-        next: next_chunk,
-        layout: chunk_layout.layout,
-    });
-
-    let slots_ptr = alloc_ptr.add(chunk_layout.slots_offset).cast::<Slot<T>>();
-
-    // Initialize the slots into a linked list pointing to the next slot.
-    for i in 0..capacity - 1 {
-        let next = Slot {
-            free: NonNull::new(slots_ptr.add(i + 1)),
-        };
-        slots_ptr.add(i).write(next);
-    }
-
-    let slots_tail_ptr = slots_ptr.add(capacity - 1);
-    // Set the last one to point to nothing.
-    slots_tail_ptr.write(Slot { free: None });
-
-    Ok((
-        NonNull::new_unchecked(chunk_ptr),
-        NewSlots {
-            slot_head: NonNull::new_unchecked(slots_ptr),
-            slot_tail: NonNull::new_unchecked(slots_tail_ptr),
-        },
-    ))
 }
 
 pub struct Fixed;
@@ -178,7 +198,7 @@ pub type ResizableObjectPool<T> = ObjectPool<T, Resizable>;
 // to care about the kind, as all it needs to do is manipulate the linked list
 // of free slots.
 struct FreeList<T> {
-    head: NodePtr<T>,
+    head: SlotPtr<T>,
     // This stores the number of slots that are *NOT* in this linked list.
     used_slot_count: usize,
 }
@@ -192,7 +212,7 @@ impl<T> Clone for FreeList<T> {
 impl<T> Copy for FreeList<T> {}
 
 pub struct ObjectPool<T, Kind> {
-    alloc_data: RefCell<AllocData>,
+    alloc_data: RefCell<ChunkManager>,
     // The head of the linked-list of free slots.
     free_list: Cell<FreeList<T>>,
     // I think invariance is what I want here?
@@ -202,9 +222,10 @@ pub struct ObjectPool<T, Kind> {
 
 impl<T: Sized> ObjectPool<T, Fixed> {
     pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0);
-        let (chunk_ptr, new_slots) = unsafe { allocate_chunk(None, capacity).unwrap() };
-        Self::init(capacity, Some(chunk_ptr), Some(new_slots.slot_head))
+        // The only difference between a fixed pool and a resizable pool is that
+        // a fixed one cannot grow. So we can just start resizable, grow it,
+        // then make it fixed.
+        ResizableObjectPool::<T>::with_capacity(capacity).into_fixed()
     }
 
     pub fn into_resizable(self) -> ObjectPool<T, Resizable> {
@@ -220,12 +241,35 @@ impl<T: Sized> ObjectPool<T, Fixed> {
 impl<T: Sized> ObjectPool<T, Resizable> {
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0);
-        let (chunk_ptr, new_slots) = unsafe { allocate_chunk(None, capacity).unwrap() };
-        Self::init(capacity, Some(chunk_ptr), Some(new_slots.slot_head))
+        let pool = Self::new();
+
+        {
+            let mut alloc_data = pool.alloc_data.borrow_mut();
+            let new_slots = alloc_data.grow_exact(capacity).unwrap();
+            pool.free_list.set(FreeList {
+                head: Some(new_slots.slot_head),
+                used_slot_count: 0,
+            });
+        }
+
+        pool
     }
 
     pub const fn new() -> Self {
-        Self::init(0, None, None)
+        let alloc_data = ChunkManager {
+            total_capacity: 0,
+            chunks: None,
+        };
+
+        ObjectPool {
+            alloc_data: RefCell::new(alloc_data),
+            free_list: Cell::new(FreeList {
+                head: None,
+                used_slot_count: 0,
+            }),
+            _ph: PhantomData,
+            _kind: PhantomData,
+        }
     }
 
     pub fn into_fixed(self) -> ObjectPool<T, Fixed> {
@@ -237,6 +281,7 @@ impl<T: Sized> ObjectPool<T, Resizable> {
         }
     }
 
+    // Ensures that there are enough slots for at least `additional` new items.
     pub fn try_reserve(&self, additional: usize) -> Result<(), PoolErrorKind> {
         let mut alloc_data = self.alloc_data.borrow_mut();
         let free_list = self.free_list.get();
@@ -252,7 +297,7 @@ impl<T: Sized> ObjectPool<T, Resizable> {
             return Ok(());
         };
 
-        let new_slots = alloc_data.grow(new_slot_count)?;
+        let new_slots = alloc_data.grow_ammortized(new_slot_count)?;
         unsafe {
             // Add the old list to the end of the new list.
             new_slots.slot_tail.as_ptr().write(Slot {
@@ -267,16 +312,18 @@ impl<T: Sized> ObjectPool<T, Resizable> {
         Ok(())
     }
 
+    #[track_caller]
     pub fn reserve(&self, additional: usize) {
         self.try_reserve(additional)
             .expect("failed to reserve additional space");
     }
 
+    // Allocates a slot in the pol, growing it if needed.
     pub fn try_alloc(&self, val: T) -> Result<Handle<'_, T>, (T, PoolErrorKind)> {
         let free_list = self.free_list.get();
         if free_list.head.is_none() {
             let mut alloc_data = self.alloc_data.borrow_mut();
-            match alloc_data.grow(1) {
+            match alloc_data.grow_ammortized(1) {
                 // In this case we know that our current free slots is already empty, so we can throw away
                 // the pointer to the tail of the new slot list
                 Ok(new_slots) => {
@@ -289,7 +336,8 @@ impl<T: Sized> ObjectPool<T, Resizable> {
             }
         }
 
-        self.alloc_within_capacity(val)
+        // We've just ensured we have the capacity, so this cannot fail.
+        Ok(self.alloc_within_capacity(val).map_err(|_| ()).unwrap())
     }
 
     #[track_caller]
@@ -299,27 +347,6 @@ impl<T: Sized> ObjectPool<T, Resizable> {
 }
 
 impl<T: Sized, Kind> ObjectPool<T, Kind> {
-    const fn init(
-        capacity: usize,
-        chunk_ptr: Option<NonNull<ChunkHeader>>,
-        free_head: Option<NonNull<Slot<T>>>,
-    ) -> ObjectPool<T, Kind> {
-        let alloc_data = AllocData {
-            total_capacity: capacity,
-            chunks: chunk_ptr,
-        };
-
-        ObjectPool {
-            alloc_data: RefCell::new(alloc_data),
-            free_list: Cell::new(FreeList {
-                head: free_head,
-                used_slot_count: 0,
-            }),
-            _ph: PhantomData,
-            _kind: PhantomData,
-        }
-    }
-
     pub fn capacity(&self) -> usize {
         self.alloc_data.borrow().total_capacity
     }
@@ -332,15 +359,16 @@ impl<T: Sized, Kind> ObjectPool<T, Kind> {
         self.len() == 0
     }
 
-    pub fn alloc_within_capacity(&self, val: T) -> Result<Handle<'_, T>, (T, PoolErrorKind)> {
+    // Tries to allocate a slot in the pool. Will return the value if there are no available slots.
+    pub fn alloc_within_capacity(&self, val: T) -> Result<Handle<'_, T>, T> {
         let free_list = self.free_list.get();
         let free_head_ptr = match free_list.head {
             Some(ptr) => ptr,
-            None => return Err((val, PoolErrorKind::PoolFull)),
+            None => return Err(val),
         };
 
-        // SAFETY: Slots can only be in the free list when they are unused as we remove them
-        // from the list when we use them.
+        // SAFETY: Slots can only be in the free list when they are unused because we remove them
+        // from the list when we allocate into them.
         unsafe {
             let next_ptr = free_head_ptr.as_ptr().replace(Slot {
                 used: ManuallyDrop::new(val),
@@ -365,20 +393,24 @@ impl<T: Sized> Default for ObjectPool<T, Resizable> {
     }
 }
 
+// Owns an allocated slot in a pool. This also owns the `T` in the pool, and the `T` will
+// be dropped when the Handle drops.
 pub struct Handle<'pool, T> {
+    // This is the linked list of free slots. We need this so we can re-insert our
+    // slot into it when we drop.
     pool: &'pool Cell<FreeList<T>>,
     slot_ptr: NonNull<Slot<T>>,
-    // It's the handle the owns the T, not the pool. The T drops when the handle does.
     _ph: PhantomData<T>,
 }
 
-// Just forward the debug impl
+// Just forward the Debug impl
 impl<T: Debug> Debug for Handle<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(&**self, f)
     }
 }
 
+// Same for Display.
 impl<T: Display> Display for Handle<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&**self, f)
@@ -389,7 +421,7 @@ impl<'pool, T> Deref for Handle<'pool, T> {
     type Target = T;
 
     fn deref(&self) -> &'pool Self::Target {
-        // SAFETY: We ensured that this slot was set to used when we allocated it.
+        // SAFETY: The slot was initialized to the `used` state when it was allocated.
         unsafe {
             let t_ref = self.slot_ptr.as_ref();
             &t_ref.used
@@ -399,7 +431,7 @@ impl<'pool, T> Deref for Handle<'pool, T> {
 
 impl<'pool, T> DerefMut for Handle<'pool, T> {
     fn deref_mut(&mut self) -> &'pool mut Self::Target {
-        // SAFETY: We ensured that this slot was set to used when we allocated it.
+        // SAFETY: The slot was initialized to the `used` state when it was allocated.
         unsafe {
             let t_ref = self.slot_ptr.as_mut();
             &mut t_ref.used
@@ -411,7 +443,7 @@ impl<T: Sized> Drop for Handle<'_, T> {
     fn drop(&mut self) {
         let free_list = self.pool.get();
         // SAFETY: Our slot pointer came from the pool, which only hands out valid pointers.
-        // We also know that it must be in the used state.
+        // The pool initialized it into the `used` state before handing it to us.
         unsafe {
             ManuallyDrop::drop(&mut self.slot_ptr.as_mut().used);
             self.slot_ptr.as_ptr().write(Slot {
