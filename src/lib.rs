@@ -221,13 +221,6 @@ pub struct ObjectPool<T, Kind> {
 }
 
 impl<T: Sized> ObjectPool<T, Fixed> {
-    pub fn new(capacity: usize) -> Self {
-        // The only difference between a fixed pool and a resizable pool is that
-        // a fixed one cannot grow. So we can just start resizable, grow it,
-        // then make it fixed.
-        ResizableObjectPool::<T>::with_capacity(capacity).into_fixed()
-    }
-
     pub fn into_resizable(self) -> ObjectPool<T, Resizable> {
         ObjectPool {
             alloc_data: self.alloc_data,
@@ -239,37 +232,8 @@ impl<T: Sized> ObjectPool<T, Fixed> {
 }
 
 impl<T: Sized> ObjectPool<T, Resizable> {
-    pub fn with_capacity(capacity: usize) -> Self {
-        assert!(capacity > 0);
-        let pool = Self::new();
-
-        {
-            let mut alloc_data = pool.alloc_data.borrow_mut();
-            let new_slots = alloc_data.grow_exact(capacity).unwrap();
-            pool.free_list.set(FreeList {
-                head: Some(new_slots.slot_head),
-                used_slot_count: 0,
-            });
-        }
-
-        pool
-    }
-
-    pub const fn new() -> Self {
-        let alloc_data = ChunkManager {
-            total_capacity: 0,
-            chunks: None,
-        };
-
-        ObjectPool {
-            alloc_data: RefCell::new(alloc_data),
-            free_list: Cell::new(FreeList {
-                head: None,
-                used_slot_count: 0,
-            }),
-            _ph: PhantomData,
-            _kind: PhantomData,
-        }
+    pub fn new() -> Self {
+        Self::init()
     }
 
     pub fn into_fixed(self) -> ObjectPool<T, Fixed> {
@@ -347,6 +311,39 @@ impl<T: Sized> ObjectPool<T, Resizable> {
 }
 
 impl<T: Sized, Kind> ObjectPool<T, Kind> {
+    const fn init() -> Self {
+        let alloc_data = ChunkManager {
+            total_capacity: 0,
+            chunks: None,
+        };
+
+        ObjectPool {
+            alloc_data: RefCell::new(alloc_data),
+            free_list: Cell::new(FreeList {
+                head: None,
+                used_slot_count: 0,
+            }),
+            _ph: PhantomData,
+            _kind: PhantomData,
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0);
+        let pool = Self::init();
+
+        {
+            let mut alloc_data = pool.alloc_data.borrow_mut();
+            let new_slots = alloc_data.grow_exact(capacity).unwrap();
+            pool.free_list.set(FreeList {
+                head: Some(new_slots.slot_head),
+                used_slot_count: 0,
+            });
+        }
+
+        pool
+    }
+
     pub fn capacity(&self) -> usize {
         self.alloc_data.borrow().total_capacity
     }
@@ -463,7 +460,7 @@ mod tests {
 
     #[test]
     fn construct_fixed() {
-        let _pool = FixedObjectPool::<String>::new(32);
+        let _pool = FixedObjectPool::<String>::with_capacity(32);
     }
 
     #[test]
@@ -490,7 +487,7 @@ mod tests {
 
     #[test]
     fn alloc_to_capacity_fixed() {
-        let pool = FixedObjectPool::new(3);
+        let pool = FixedObjectPool::with_capacity(3);
         let a = pool.alloc_within_capacity(String::from("Hello")).unwrap();
         let b = pool
             .alloc_within_capacity(String::from("Dia dhuit"))
@@ -525,7 +522,7 @@ mod tests {
 
     #[test]
     fn two_alloc_drop_alloc() {
-        let pool = FixedObjectPool::new(2);
+        let pool = FixedObjectPool::with_capacity(2);
         let a = pool.alloc_within_capacity(String::from("Hello")).unwrap();
         let b = pool
             .alloc_within_capacity(String::from("Dia dhuit"))
