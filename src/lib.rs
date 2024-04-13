@@ -640,4 +640,17 @@ mod tests {
         let g = pool.alloc_within_capacity(7);
         assert!(g.is_err());
     }
+
+    #[test]
+    fn write_to_slot() {
+        let pool = ResizableObjectPool::new();
+        let mut a = pool.alloc(String::from("Hi"));
+        let mut b = pool.alloc(String::from("Dia dhuit"));
+
+        *a = String::from("Tere");
+        *b = String::from("Salam");
+
+        assert_eq!(*a, "Tere");
+        assert_eq!(*b, "Salam");
+    }
 }
