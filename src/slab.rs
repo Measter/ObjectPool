@@ -1,5 +1,4 @@
 use std::{
-    alloc::Layout,
     cell::{Cell, RefCell},
     fmt::{Debug, Display},
     marker::PhantomData,
@@ -8,12 +7,7 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::ErrorKind;
-
-// We could start off small, and only store 4 slots like a Vec, however in this case
-// the allocations stick around for the lifetime of the pool so I figure that it's
-// probably a bit better to start off bigger.
-const DEFAULT_CAPACITY: usize = 32;
+use crate::{chunk_manager::ChunkManager, ErrorKind};
 
 // This is where an individual item in the pool is stored. When in the `free` state it is
 // part of a linked-list of empty slots. During allocation it is removed from the list
@@ -23,147 +17,14 @@ union Slot<T> {
     used: ManuallyDrop<T>,
     free: SlotPtr<T>,
 }
+
+impl<T> crate::chunk_manager::Slot for Slot<T> {
+    fn init(next: Option<NonNull<Self>>) -> Self {
+        Slot { free: next }
+    }
+}
+
 type SlotPtr<T> = Option<NonNull<Slot<T>>>;
-
-struct ChunkHeader {
-    // Chunks are stored as a linked-list, so this stores the pointer to the next chunk.
-    next: Option<NonNull<ChunkHeader>>,
-    // Each chunk is of a different size, dependent on the size of the `T` in the pool
-    // and the capacity of the chunk.
-    // To avoid making the ChunkManager generic over `T` so it can drop the chunk we
-    // store the size of the allocation.
-    layout: Layout,
-}
-
-struct ChunkLayout {
-    layout: Layout,
-    slots_offset: usize,
-}
-
-impl ChunkLayout {
-    /// Calculates the layout of a `ChunkHeader` followed by `capacity` * `Slot<T>`
-    fn get<T: Sized>(capacity: usize) -> Result<ChunkLayout, ErrorKind> {
-        assert!(capacity > 0);
-
-        let header = Layout::new::<ChunkHeader>();
-        let slots = Layout::array::<Slot<T>>(capacity).map_err(|_| ErrorKind::CapacityOverflow)?;
-        let (chunk_layout, slots_offset) = header
-            .extend(slots)
-            .map_err(|_| ErrorKind::CapacityOverflow)?;
-
-        Ok(ChunkLayout {
-            layout: chunk_layout.pad_to_align(),
-            slots_offset,
-        })
-    }
-}
-
-// This manages the allocation and deallocation of our chunks.
-// We track the total capacity here because it is used while growing the storage
-// so that we grow like a Vec.
-struct ChunkManager {
-    // The total capacity of all the chunks together.
-    total_capacity: usize,
-    // Pointer to the first chunk in our allocation list.
-    chunks: Option<NonNull<ChunkHeader>>,
-}
-
-impl Drop for ChunkManager {
-    fn drop(&mut self) {
-        // SAFETY: Allocations using any chunk borrow the entire pool. The borrow checker ensures
-        // that we can't drop while a borrow exists.
-        // The `PoolRef`s handle dropping each `T`, so if we got here we know that all the slots are
-        // empty, and don't need to free them.
-        unsafe {
-            let mut store = self.chunks;
-
-            // We need to de-allocate the entire list, one chunk at a time.
-            while let Some(alloc) = store {
-                let alloc = alloc.as_ptr();
-                let header = alloc.read();
-                store = header.next;
-                std::alloc::dealloc(alloc.cast(), header.layout);
-            }
-        }
-    }
-}
-
-impl ChunkManager {
-    /// Grows by either the requested `additional` capacity, or `self.total_capacity`, whichever is larger.
-    /// This results in at least doubling the capacity each time.
-    fn grow_ammortized<T: Sized>(&mut self, additional: usize) -> Result<NewSlots<T>, ErrorKind> {
-        assert!(additional > 0);
-
-        let new_chunk_size = if self.total_capacity == 0 {
-            additional.max(DEFAULT_CAPACITY)
-        } else {
-            additional.max(self.total_capacity)
-        };
-
-        self.grow_exact(new_chunk_size)
-    }
-
-    // Grows a chunk of exactly `chunk_size` slots.
-    fn grow_exact<T: Sized>(&mut self, chunk_size: usize) -> Result<NewSlots<T>, ErrorKind> {
-        let new_total_capacity = self
-            .total_capacity
-            .checked_add(chunk_size)
-            .ok_or(ErrorKind::CapacityOverflow)?;
-
-        let (chunk_ptr, slot_ptr) = unsafe { self.allocate_chunk::<T>(chunk_size)? };
-        self.chunks = Some(chunk_ptr);
-        self.total_capacity = new_total_capacity;
-
-        Ok(slot_ptr)
-    }
-
-    /// Allocates and initializes a new chunk.
-    unsafe fn allocate_chunk<T: Sized>(
-        &self,
-        capacity: usize,
-    ) -> Result<(NonNull<ChunkHeader>, NewSlots<T>), ErrorKind> {
-        assert!(capacity > 0);
-        let chunk_layout = ChunkLayout::get::<T>(capacity)?;
-
-        let alloc_ptr = std::alloc::alloc(chunk_layout.layout);
-        if alloc_ptr.is_null() {
-            return Err(ErrorKind::AllocatorError);
-        }
-
-        let chunk_ptr = alloc_ptr.cast::<ChunkHeader>();
-        chunk_ptr.write(ChunkHeader {
-            next: self.chunks,
-            layout: chunk_layout.layout,
-        });
-
-        let slots_ptr = alloc_ptr.add(chunk_layout.slots_offset).cast::<Slot<T>>();
-
-        // Initialize the slots into a linked list pointing to the next slot.
-        for i in 0..capacity - 1 {
-            let next = Slot {
-                free: NonNull::new(slots_ptr.add(i + 1)),
-            };
-            slots_ptr.add(i).write(next);
-        }
-
-        let slots_tail_ptr = slots_ptr.add(capacity - 1);
-        // Set the last one to point to nothing.
-        slots_tail_ptr.write(Slot { free: None });
-
-        Ok((
-            NonNull::new_unchecked(chunk_ptr),
-            NewSlots {
-                slot_head: NonNull::new_unchecked(slots_ptr),
-                slot_tail: NonNull::new_unchecked(slots_tail_ptr),
-            },
-        ))
-    }
-}
-
-struct NewSlots<T> {
-    slot_head: NonNull<Slot<T>>,
-    slot_tail: NonNull<Slot<T>>,
-}
 
 pub struct Fixed;
 pub struct Resizable;
@@ -234,12 +95,11 @@ impl<T: Sized> Slab<T, Resizable> {
             .ok_or(ErrorKind::CapacityOverflow)?;
 
         // If we have enough space, don't do any work.
-        let Some(new_slot_count @ 1..) = needed_capacity.checked_sub(alloc_data.total_capacity)
-        else {
+        let Some(new_slot_count @ 1..) = needed_capacity.checked_sub(alloc_data.capacity()) else {
             return Ok(());
         };
 
-        let new_slots = alloc_data.grow_ammortized(new_slot_count)?;
+        let new_slots = alloc_data.grow_ammortized::<Slot<T>>(new_slot_count)?;
         unsafe {
             // Add the old list to the end of the new list.
             new_slots.slot_tail.as_ptr().write(Slot {
@@ -290,13 +150,8 @@ impl<T: Sized> Slab<T, Resizable> {
 
 impl<T: Sized, Kind> Slab<T, Kind> {
     const fn init() -> Self {
-        let alloc_data = ChunkManager {
-            total_capacity: 0,
-            chunks: None,
-        };
-
         Slab {
-            alloc_data: RefCell::new(alloc_data),
+            alloc_data: RefCell::new(ChunkManager::new()),
             free_list: Cell::new(FreeList {
                 head: None,
                 used_slot_count: 0,
@@ -323,7 +178,7 @@ impl<T: Sized, Kind> Slab<T, Kind> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.alloc_data.borrow().total_capacity
+        self.alloc_data.borrow().capacity()
     }
 
     pub fn len(&self) -> usize {
