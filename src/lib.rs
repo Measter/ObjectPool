@@ -1,6 +1,7 @@
 use std::{error::Error, fmt::Display};
 
 mod chunk_manager;
+pub mod pool;
 pub mod slab;
 
 #[derive(Debug, Clone, Copy)]
