@@ -124,6 +124,33 @@ where
         Self::init(init, reset)
     }
 
+    pub fn try_reserve(&self, additional: usize) -> Result<(), ErrorKind> {
+        let mut chunk_manager = self.chunk_manager.borrow_mut();
+        let mut free_list = self.free_list.borrow_mut();
+
+        let needed_capacity = free_list
+            .used_slot_count
+            .checked_add(additional)
+            .ok_or(ErrorKind::CapacityOverflow)?;
+
+        // If we have enough space, don't do any work.
+        let Some(new_slot_count @ 1..) = needed_capacity.checked_sub(chunk_manager.capacity())
+        else {
+            return Ok(());
+        };
+
+        let new_slots = chunk_manager.grow_ammortized::<Slot<T>>(new_slot_count)?;
+        free_list.append(new_slots);
+
+        Ok(())
+    }
+
+    #[track_caller]
+    pub fn reserve(&self, additional: usize) {
+        self.try_reserve(additional)
+            .expect("failed to reserve space");
+    }
+
     pub fn try_alloc(&self) -> Result<Handle<'_, T, Reset>, ErrorKind> {
         let mut free_list = self.free_list.borrow_mut();
         if free_list.head.is_none() {
@@ -138,7 +165,7 @@ where
 
     #[track_caller]
     pub fn alloc(&self) -> Handle<'_, T, Reset> {
-        self.try_alloc().unwrap()
+        self.try_alloc().expect("failed to allocate a slot")
     }
 }
 
@@ -394,5 +421,71 @@ mod tests {
             assert_eq!(*a, "Reset");
             assert_eq!(*b, "Reset");
         }
+    }
+
+    #[test]
+    fn reserve_capacity_grow_double() {
+        let pool = ResizablePool::with_capacity(3, || 0, |_| ());
+        let _a = pool.alloc();
+        let _b = pool.alloc();
+        let _c = pool.alloc();
+        let d = pool.alloc_within_capacity();
+        assert!(d.is_none());
+
+        pool.reserve(1);
+        assert_eq!(pool.capacity(), 6);
+
+        let _e = pool.alloc();
+        let _f = pool.alloc();
+        let _g = pool.alloc();
+        let h = pool.alloc_within_capacity();
+        assert!(h.is_none());
+    }
+
+    #[test]
+    fn reserve_exactly_free_slots() {
+        let pool = ResizablePool::with_capacity(4, || 0, |_| ());
+        let _a = pool.alloc();
+        let _b = pool.alloc();
+
+        pool.reserve(2);
+        assert_eq!(pool.capacity(), 4);
+
+        let _c = pool.alloc();
+        let _d = pool.alloc();
+        let e = pool.alloc_within_capacity();
+        assert!(e.is_none());
+    }
+
+    #[test]
+    fn reserve_less_than_free_slots() {
+        let pool = ResizablePool::with_capacity(4, || 0, |_| ());
+        let _a = pool.alloc();
+        let _b = pool.alloc();
+
+        pool.reserve(1);
+        assert_eq!(pool.capacity(), 4);
+
+        let _c = pool.alloc();
+        let _d = pool.alloc();
+        let e = pool.alloc_within_capacity();
+        assert!(e.is_none());
+    }
+
+    #[test]
+    fn reserve_more_than_double() {
+        let pool = ResizablePool::with_capacity(2, || 0, |_| ());
+        let _a = pool.alloc();
+
+        pool.reserve(5);
+        assert_eq!(pool.capacity(), 6);
+
+        let _b = pool.alloc();
+        let _c = pool.alloc();
+        let _d = pool.alloc();
+        let _e = pool.alloc();
+        let _f = pool.alloc();
+        let g = pool.alloc_within_capacity();
+        assert!(g.is_none());
     }
 }
