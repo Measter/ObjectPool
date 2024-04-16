@@ -151,6 +151,29 @@ where
             .expect("failed to reserve space");
     }
 
+    pub fn try_ensure_init(&self, num: usize) -> Result<(), ErrorKind> {
+        self.try_reserve(num)?;
+        let free_list = self.free_list.borrow_mut();
+        let mut cur_slot = free_list.head;
+        for _ in 0..num {
+            let mut slot_ptr = cur_slot.unwrap();
+            // SAFETY: The ChunkManager ensures all slots are initialized.
+            let slot_ref = unsafe { slot_ptr.as_mut() };
+            cur_slot = slot_ref.next;
+            if slot_ref.item.is_none() {
+                slot_ref.item = Some((self.init)());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[track_caller]
+    pub fn pre_init(&self, num: usize) {
+        self.try_ensure_init(num)
+            .expect("failed to initialized slots")
+    }
+
     pub fn try_alloc(&self) -> Result<Handle<'_, T, Reset>, ErrorKind> {
         let mut free_list = self.free_list.borrow_mut();
         if free_list.head.is_none() {
@@ -320,6 +343,8 @@ impl<T: Sized, R: Fn(&mut T)> Drop for Handle<'_, T, R> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -487,5 +512,42 @@ mod tests {
         let _f = pool.alloc();
         let g = pool.alloc_within_capacity();
         assert!(g.is_none());
+    }
+
+    #[test]
+    fn pre_init_fresh() {
+        let init_count = Cell::new(0);
+        let pool = ResizablePool::new(
+            || {
+                init_count.set(init_count.get() + 1);
+                0
+            },
+            |_| (),
+        );
+
+        assert_eq!(init_count.get(), 0);
+        pool.pre_init(3);
+        assert_eq!(init_count.get(), 3);
+    }
+
+    #[test]
+    fn pre_init_with_some_used() {
+        let init_count = Cell::new(0);
+        let pool = ResizablePool::new(
+            || {
+                init_count.set(init_count.get() + 1);
+                0
+            },
+            |_| (),
+        );
+
+        {
+            let _a = pool.alloc();
+            let _b = pool.alloc();
+        }
+
+        assert_eq!(init_count.get(), 2);
+        pool.pre_init(4);
+        assert_eq!(init_count.get(), 4);
     }
 }
