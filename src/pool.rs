@@ -151,7 +151,7 @@ where
             .expect("failed to reserve space");
     }
 
-    pub fn try_ensure_init(&self, num: usize) -> Result<(), ErrorKind> {
+    pub fn try_pre_init(&self, num: usize) -> Result<(), ErrorKind> {
         self.try_reserve(num)?;
         let free_list = self.free_list.borrow_mut();
         let mut cur_slot = free_list.head;
@@ -170,8 +170,7 @@ where
 
     #[track_caller]
     pub fn pre_init(&self, num: usize) {
-        self.try_ensure_init(num)
-            .expect("failed to initialized slots")
+        self.try_pre_init(num).expect("failed to initialized slots")
     }
 
     pub fn try_alloc(&self) -> Result<Handle<'_, T, Reset>, ErrorKind> {
