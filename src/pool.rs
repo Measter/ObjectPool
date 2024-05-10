@@ -1,4 +1,5 @@
 use std::{
+    alloc::Layout,
     cell::RefCell,
     fmt::{Debug, Display},
     marker::PhantomData,
@@ -197,15 +198,18 @@ where
     Init: Fn() -> T,
     Reset: Fn(&mut T),
 {
-    const fn init(init: Init, reset: Reset) -> Self {
+    fn init(init: Init, reset: Reset) -> Self {
         let free_list = FreeList {
             head: None,
             tail: None,
             used_slot_count: 0,
             reset,
         };
+
+        let slot_layout = Layout::new::<Slot<T>>();
+
         Self {
-            chunk_manager: RefCell::new(ChunkManager::new()),
+            chunk_manager: RefCell::new(ChunkManager::new(slot_layout)),
             free_list: RefCell::new(free_list),
             init,
             _ph: PhantomData,

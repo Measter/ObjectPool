@@ -28,11 +28,18 @@ struct ChunkLayout {
 
 impl ChunkLayout {
     /// Calculates the layout of a `ChunkHeader` followed by `capacity` * `Slot<T>`
-    fn get<T: Slot>(capacity: usize) -> Result<ChunkLayout, ErrorKind> {
+    fn get(capacity: usize, slot_layout: Layout) -> Result<ChunkLayout, ErrorKind> {
         assert!(capacity > 0);
 
         let header = Layout::new::<ChunkHeader>();
-        let slots = Layout::array::<T>(capacity).map_err(|_| ErrorKind::CapacityOverflow)?;
+
+        let slots_size = slot_layout
+            .size()
+            .checked_mul(capacity)
+            .ok_or(ErrorKind::CapacityOverflow)?;
+        let slots = Layout::from_size_align(slots_size, slot_layout.align())
+            .map_err(|_| ErrorKind::CapacityOverflow)?;
+
         let (chunk_layout, slots_offset) = header
             .extend(slots)
             .map_err(|_| ErrorKind::CapacityOverflow)?;
@@ -52,6 +59,9 @@ pub(crate) struct ChunkManager {
     total_capacity: usize,
     // Pointer to the first chunk in our allocation list.
     chunks: Option<NonNull<ChunkHeader>>,
+    // Stores the layout for in individual slot.
+    // Padded to alignment during the constructor.
+    slot_layout: Layout,
 }
 
 impl Drop for ChunkManager {
@@ -75,10 +85,11 @@ impl Drop for ChunkManager {
 }
 
 impl ChunkManager {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new(slot_layout: Layout) -> Self {
         Self {
             total_capacity: 0,
             chunks: None,
+            slot_layout: slot_layout.pad_to_align(),
         }
     }
 
@@ -93,6 +104,9 @@ impl ChunkManager {
         additional: usize,
     ) -> Result<NewSlots<T>, ErrorKind> {
         assert!(additional > 0);
+        let t_layout = Layout::new::<T>();
+        assert!(t_layout.size() <= self.slot_layout.size());
+        assert!(t_layout.align() <= self.slot_layout.align());
 
         let new_chunk_size = if self.total_capacity == 0 {
             additional.max(DEFAULT_CAPACITY)
@@ -108,6 +122,10 @@ impl ChunkManager {
         &mut self,
         chunk_size: usize,
     ) -> Result<NewSlots<T>, ErrorKind> {
+        let t_layout = Layout::new::<T>();
+        assert!(t_layout.size() <= self.slot_layout.size());
+        assert!(t_layout.align() <= self.slot_layout.align());
+
         let new_total_capacity = self
             .total_capacity
             .checked_add(chunk_size)
@@ -126,7 +144,7 @@ impl ChunkManager {
         capacity: usize,
     ) -> Result<(NonNull<ChunkHeader>, NewSlots<T>), ErrorKind> {
         assert!(capacity > 0);
-        let chunk_layout = ChunkLayout::get::<T>(capacity)?;
+        let chunk_layout = ChunkLayout::get(capacity, self.slot_layout)?;
 
         let alloc_ptr = std::alloc::alloc(chunk_layout.layout);
         if alloc_ptr.is_null() {
@@ -141,14 +159,19 @@ impl ChunkManager {
 
         let slots_ptr = alloc_ptr.add(chunk_layout.slots_offset).cast::<T>();
 
+        let calc_idx = move |i: usize| i * self.slot_layout.size();
+
         // Initialize the slots into a linked list pointing to the next slot.
         for i in 0..capacity - 1 {
-            let next_ptr = NonNull::new(slots_ptr.add(i + 1));
+            // The T we're writing is the empty slot, which in the case of the slab
+            // allocator is only the size of a pointer, not the size of the
+            // data being stored.
+            let next_ptr = NonNull::new(slots_ptr.byte_add(calc_idx(i + 1)));
             let item = T::init(next_ptr);
-            slots_ptr.add(i).write(item);
+            slots_ptr.byte_add(calc_idx(i)).write(item);
         }
 
-        let slots_tail_ptr = slots_ptr.add(capacity - 1);
+        let slots_tail_ptr = slots_ptr.byte_add(calc_idx(capacity - 1));
         // Set the last one to point to nothing.
         slots_tail_ptr.write(T::init(None));
 

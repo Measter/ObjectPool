@@ -1,4 +1,5 @@
 use std::{
+    alloc::Layout,
     cell::{Cell, RefCell},
     fmt::{Debug, Display},
     marker::PhantomData,
@@ -149,9 +150,11 @@ impl<T: Sized> Slab<T, Resizable> {
 }
 
 impl<T: Sized, Kind> Slab<T, Kind> {
-    const fn init() -> Self {
+    fn init() -> Self {
+        let slot_layout = Layout::new::<Slot<T>>();
+
         Slab {
-            alloc_data: RefCell::new(ChunkManager::new()),
+            alloc_data: RefCell::new(ChunkManager::new(slot_layout)),
             free_list: Cell::new(FreeList {
                 head: None,
                 used_slot_count: 0,
