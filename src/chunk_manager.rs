@@ -93,6 +93,10 @@ impl ChunkManager {
         }
     }
 
+    pub(crate) fn slot_layout(&self) -> Layout {
+        self.slot_layout
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.total_capacity
     }
